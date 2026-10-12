@@ -1,3 +1,23 @@
+## 5.3.0
+
+- Fix connecting through an HTTP proxy (`ChannelOptions.proxy`):
+  - Read the whole response header to `CONNECT` instead of only the first
+    chunk, and accept any `2xx` status for both `HTTP/1.0` and `HTTP/1.1`.
+  - Fail the connection attempt with a `ProxyConnectionException` describing
+    the target, the proxy and the reason, instead of hanging forever when the
+    proxy rejects `CONNECT`, closes the connection or sends an invalid
+    response. For `407` responses, the scheme requested in
+    `Proxy-Authenticate` is included.
+  - Verify the TLS certificate against the target instead of the proxy host.
+  - Send IPv6 targets in brackets and `InternetAddress` targets as addresses
+    in the `CONNECT` request.
+  - Remove a leftover `print` of the proxy response.
+- Request the `h2` protocol via ALPN on TLS connections. Without it, proxies
+  and other middleboxes may treat the connection as HTTP/1.1.
+- Add `ChannelOptions.proxyConnectResponseTimeout` and
+  `ChannelOptions.tlsHandshakeTimeout` (both default to 10 seconds), as
+  `ChannelOptions.connectTimeout` only covers opening the TCP connection.
+
 ## 5.2.0
 
 - Update default `user-agent` header from `dart-grpc/2.0.0` to the gRPC HTTP/2

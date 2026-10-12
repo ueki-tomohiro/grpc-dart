@@ -29,3 +29,17 @@ class Proxy {
 
   bool get isAuthenticated => username != null;
 }
+
+/// Thrown when a connection through a [Proxy] could not be established.
+///
+/// The [message] describes the target, the proxy and the reason of the
+/// failure. Calls waiting for the connection fail with a
+/// `GrpcError.unavailable` that includes this exception.
+class ProxyConnectionException implements Exception {
+  final String message;
+
+  ProxyConnectionException(this.message);
+
+  @override
+  String toString() => 'ProxyConnectionException: $message';
+}

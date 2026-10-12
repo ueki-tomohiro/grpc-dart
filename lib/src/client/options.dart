@@ -32,6 +32,12 @@ const defaultIdleTimeout = Duration(minutes: 5);
 /// connection after 50 minutes. This will avoid one failed RPC call.
 const defaultConnectionTimeOut = Duration(minutes: 50);
 
+/// Default value for [ChannelOptions.proxyConnectResponseTimeout].
+const defaultProxyConnectResponseTimeout = Duration(seconds: 10);
+
+/// Default value for [ChannelOptions.tlsHandshakeTimeout].
+const defaultTlsHandshakeTimeout = Duration(seconds: 10);
+
 typedef BackoffStrategy = Duration Function(Duration? lastBackoff);
 
 // Backoff algorithm from https://github.com/grpc/grpc/blob/master/doc/connection-backoff.md
@@ -67,6 +73,20 @@ class ChannelOptions {
   final ClientKeepAliveOptions keepAlive;
   final Proxy? proxy;
 
+  /// The maximum time to wait for the response to the HTTP `CONNECT` request
+  /// sent to [proxy].
+  ///
+  /// [connectTimeout] only covers opening the TCP connection to the proxy, so
+  /// a proxy that accepts the connection but never answers would otherwise
+  /// block the connection attempt forever.
+  final Duration proxyConnectResponseTimeout;
+
+  /// The maximum time to wait for the TLS handshake to complete.
+  ///
+  /// Applies to both direct connections and connections tunneled through
+  /// [proxy]. [connectTimeout] only covers opening the TCP connection.
+  final Duration tlsHandshakeTimeout;
+
   const ChannelOptions({
     this.credentials = const ChannelCredentials.secure(),
     this.idleTimeout = defaultIdleTimeout,
@@ -77,5 +97,7 @@ class ChannelOptions {
     this.codecRegistry,
     this.keepAlive = const ClientKeepAliveOptions(),
     this.proxy,
+    this.proxyConnectResponseTimeout = defaultProxyConnectResponseTimeout,
+    this.tlsHandshakeTimeout = defaultTlsHandshakeTimeout,
   }) : _userAgent = userAgent;
 }
