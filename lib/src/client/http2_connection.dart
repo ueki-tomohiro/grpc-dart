@@ -364,6 +364,16 @@ class Http2ClientConnection implements connection.ClientConnection {
   }
 }
 
+/// The maximum size of the response header to a proxy `CONNECT` request.
+///
+/// Guards against buffering forever when the peer is not an HTTP proxy.
+const _maxProxyResponseHeaderBytes = 16 * 1024;
+
+/// `\r\n\r\n`, the end of an HTTP header.
+const _headerTerminator = [13, 10, 13, 10];
+
+final _proxyStatusLinePattern = RegExp(r'^HTTP/1\.[01]\s+(\d{3})\b');
+
 class SocketTransportConnector implements ClientTransportConnector {
   /// Either [InternetAddress] or [String].
   final Object _host;
@@ -388,18 +398,7 @@ class SocketTransportConnector implements ClientTransportConnector {
       socket.setOption(SocketOption.tcpNoDelay, true);
     }
     if (securityContext != null) {
-      // Todo(sigurdm): We want to pass supportedProtocols: ['h2'].
-      // http://dartbug.com/37950
-      socket = await SecureSocket.secure(
-        socket,
-        // This is not really the host, but the authority to verify the TLC
-        // connection against.
-        //
-        // We don't use `this.authority` here, as that includes the port.
-        host: _options.credentials.authority ?? host,
-        context: securityContext,
-        onBadCertificate: _validateBadCertificate,
-      );
+      socket = await _secure(socket, securityContext);
       incoming = socket;
     }
     return ClientTransportConnection.viaStreams(incoming, socket);
@@ -414,18 +413,99 @@ class SocketTransportConnector implements ClientTransportConnector {
   }
 
   Future<Socket> initSocket(Object host, int port) async {
-    return await Socket.connect(host, port, timeout: _options.connectTimeout);
+    final proxy = this.proxy;
+    try {
+      return await Socket.connect(host, port, timeout: _options.connectTimeout);
+    } on SocketException catch (error) {
+      if (proxy == null) rethrow;
+      throw ProxyConnectionException(
+        '${_describeRoute(proxy)}: could not connect to the proxy: '
+        '${_describeSocketError(error)}',
+      );
+    }
+  }
+
+  Future<SecureSocket> _secure(
+    Socket socket,
+    SecurityContext securityContext,
+  ) async {
+    final proxy = this.proxy;
+    final handshake = SecureSocket.secure(
+      socket,
+      // This is not really the host, but the authority to verify the TLC
+      // connection against. When tunneling through a proxy, this is the
+      // target and not the proxy.
+      //
+      // We don't use `this.authority` here, as that includes the port.
+      host: _options.credentials.authority ?? _host,
+      context: securityContext,
+      onBadCertificate: _validateBadCertificate,
+      // Without ALPN, middleboxes may treat the connection as HTTP/1.1.
+      supportedProtocols: const ['h2'],
+    );
+
+    final SecureSocket secureSocket;
+    try {
+      secureSocket = await handshake.timeout(_options.tlsHandshakeTimeout);
+    } on TimeoutException {
+      // Once handed to `SecureSocket.secure`, destroying `socket` does
+      // nothing. Make sure a handshake completing after the timeout does not
+      // leave a connection behind.
+      unawaited(
+        handshake.then((secured) => secured.destroy(), onError: (Object _) {}),
+      );
+      socket.destroy();
+      final message =
+          'TLS handshake did not complete within '
+          '${_options.tlsHandshakeTimeout.inMilliseconds} ms';
+      if (proxy == null) {
+        throw TimeoutException(
+          '$message: $authority',
+          _options.tlsHandshakeTimeout,
+        );
+      }
+      throw ProxyConnectionException('${_describeRoute(proxy)}: $message');
+    } catch (error) {
+      socket.destroy();
+      if (proxy == null) rethrow;
+      throw ProxyConnectionException(
+        '${_describeRoute(proxy)}: TLS handshake through the tunnel failed: '
+        '$error',
+      );
+    }
+
+    final selectedProtocol = secureSocket.selectedProtocol;
+    // `null` means the server does not support ALPN, which is allowed.
+    if (selectedProtocol != null && selectedProtocol != 'h2') {
+      secureSocket.destroy();
+      final message =
+          'ALPN negotiated "$selectedProtocol" instead of "h2", '
+          'HTTP/2 is not available';
+      if (proxy == null) {
+        throw TransportException('$authority: $message');
+      }
+      throw ProxyConnectionException('${_describeRoute(proxy)}: $message');
+    }
+    return secureSocket;
   }
 
   void _sendConnect(Map<String, String> headers) {
     const linebreak = '\r\n';
-    socket.write('CONNECT $_host:$_port HTTP/1.1');
+    socket.write('CONNECT $_connectTarget HTTP/1.1');
     socket.write(linebreak);
     headers.forEach((key, value) {
       socket.write('$key: $value');
       socket.write(linebreak);
     });
     socket.write(linebreak);
+  }
+
+  /// The `host:port` of the target, as used in the `CONNECT` request.
+  String get _connectTarget {
+    final host = _host;
+    final hostName = host is InternetAddress ? host.address : host as String;
+    // IPv6 literals must be enclosed in brackets.
+    return hostName.contains(':') ? '[$hostName]:$_port' : '$hostName:$_port';
   }
 
   @override
@@ -470,7 +550,7 @@ class SocketTransportConnector implements ClientTransportConnector {
   }
 
   Future<Stream<List<int>>> connectToProxy(Proxy proxy) async {
-    final headers = {'Host': '$_host:$_port'};
+    final headers = {'Host': _connectTarget};
     if (proxy.isAuthenticated) {
       // If the proxy configuration contains user information use that
       // for proxy basic authorization.
@@ -478,42 +558,158 @@ class SocketTransportConnector implements ClientTransportConnector {
       final auth = base64Encode(utf8.encode(authStr));
       headers[HttpHeaders.proxyAuthorizationHeader] = 'Basic $auth';
     }
+    final isSecure = _options.credentials.isSecure;
     final completer = Completer<void>();
+    final buffer = <int>[];
 
-    /// Routes the events through after connection to the proxy has been
-    /// established.
-    final intermediate = StreamController<List<int>>();
+    late final StreamSubscription<Uint8List> subscription;
 
-    /// Route events after the successfull connect to the `intermediate`.
-    socket.listen(
-      (event) {
+    /// Routes the events through after the tunnel has been established.
+    final intermediate = StreamController<List<int>>(
+      onPause: () => subscription.pause(),
+      onResume: () => subscription.resume(),
+      onCancel: () => subscription.cancel(),
+    );
+
+    // When using TLS, this subscription must stay active until the socket is
+    // handed to `SecureSocket.secure`, which takes it over.
+    subscription = socket.listen(
+      (chunk) {
         if (completer.isCompleted) {
-          intermediate.sink.add(event);
-        } else {
-          _waitForResponse(event, completer);
+          intermediate.add(chunk);
+          return;
+        }
+        buffer.addAll(chunk);
+        final headerEnd = _indexOfHeaderTerminator(buffer);
+        if (headerEnd < 0) {
+          if (buffer.length > _maxProxyResponseHeaderBytes) {
+            completer.completeError(
+              ProxyConnectionException(
+                '${_describeRoute(proxy)}: the response to CONNECT did not '
+                'end within $_maxProxyResponseHeaderBytes bytes',
+              ),
+            );
+          }
+          return;
+        }
+        final header = latin1.decode(buffer.sublist(0, headerEnd));
+        final leftover = buffer.sublist(headerEnd + _headerTerminator.length);
+        try {
+          _verifyProxyResponse(proxy, header);
+          if (leftover.isNotEmpty) {
+            if (isSecure) {
+              // The client starts the TLS handshake, so the server has
+              // nothing to send yet.
+              throw ProxyConnectionException(
+                '${_describeRoute(proxy)}: received ${leftover.length} '
+                'unexpected bytes after the response to CONNECT',
+              );
+            }
+            // Already part of the HTTP/2 connection.
+            intermediate.add(Uint8List.fromList(leftover));
+          }
+          completer.complete();
+        } on ProxyConnectionException catch (error) {
+          completer.completeError(error);
         }
       },
-      onDone: intermediate.close,
-      onError: intermediate.addError,
+      onError: (Object error, StackTrace stackTrace) {
+        if (completer.isCompleted) {
+          intermediate.addError(error, stackTrace);
+          return;
+        }
+        completer.completeError(
+          ProxyConnectionException(
+            '${_describeRoute(proxy)}: could not read the response to '
+            'CONNECT: $error',
+          ),
+          stackTrace,
+        );
+      },
+      onDone: () {
+        if (completer.isCompleted) {
+          intermediate.close();
+          return;
+        }
+        completer.completeError(
+          ProxyConnectionException(
+            '${_describeRoute(proxy)}: the proxy closed the connection '
+            'before responding to CONNECT',
+          ),
+        );
+      },
     );
 
     _sendConnect(headers);
-    await completer.future;
+
+    try {
+      await completer.future.timeout(
+        _options.proxyConnectResponseTimeout,
+        onTimeout: () => throw ProxyConnectionException(
+          '${_describeRoute(proxy)}: no response to CONNECT within '
+          '${_options.proxyConnectResponseTimeout.inMilliseconds} ms',
+        ),
+      );
+    } catch (_) {
+      await subscription.cancel();
+      socket.destroy();
+      rethrow;
+    }
     return intermediate.stream;
   }
 
-  /// Wait for the response to the `CONNECT` request, which should be an
-  /// acknowledgement with a 200 status code.
-  void _waitForResponse(Uint8List chunk, Completer<void> completer) {
-    final response = ascii.decode(chunk);
-    print(response);
-    if (response.startsWith('HTTP/1.1 200')) {
-      completer.complete();
-    } else {
-      throw TransportException(
-        'Error establishing proxy connection: $response',
+  /// Verifies the response header (without the terminating empty line) to the
+  /// `CONNECT` request.
+  void _verifyProxyResponse(Proxy proxy, String header) {
+    final lines = header.split('\r\n');
+    final statusLine = lines.first;
+    final match = _proxyStatusLinePattern.firstMatch(statusLine);
+    if (match == null) {
+      throw ProxyConnectionException(
+        '${_describeRoute(proxy)}: the response to CONNECT is not HTTP: '
+        '"$statusLine"',
       );
     }
+    final statusCode = int.parse(match.group(1)!);
+    if (statusCode >= 200 && statusCode < 300) return;
+
+    final message = StringBuffer(
+      '${_describeRoute(proxy)}: the proxy rejected CONNECT ($statusLine)',
+    );
+    if (statusCode == HttpStatus.proxyAuthenticationRequired) {
+      final schemes = lines
+          .where((line) => line.toLowerCase().startsWith('proxy-authenticate:'))
+          .map((line) => line.substring(line.indexOf(':') + 1).trim())
+          .where((scheme) => scheme.isNotEmpty);
+      message.write(
+        '. Proxy authentication is required '
+        '(${schemes.isEmpty ? 'unknown scheme' : schemes.join(', ')}); '
+        'only Basic authentication is supported',
+      );
+    }
+    throw ProxyConnectionException(message.toString());
+  }
+
+  String _describeRoute(Proxy proxy) =>
+      'Connecting to $_connectTarget via proxy ${proxy.host}:${proxy.port}';
+
+  /// [SocketException.toString] shows the local port, which is misleading
+  /// here.
+  static String _describeSocketError(SocketException error) {
+    final osError = error.osError;
+    if (osError == null) return error.message;
+    return '${error.message} (${osError.message}, errno = ${osError.errorCode})';
+  }
+
+  static int _indexOfHeaderTerminator(List<int> bytes) {
+    outer:
+    for (var i = 0; i + _headerTerminator.length <= bytes.length; i++) {
+      for (var j = 0; j < _headerTerminator.length; j++) {
+        if (bytes[i + j] != _headerTerminator[j]) continue outer;
+      }
+      return i;
+    }
+    return -1;
   }
 }
 

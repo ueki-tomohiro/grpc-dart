@@ -33,10 +33,12 @@ export 'src/client/method.dart' show ClientMethod;
 export 'src/client/options.dart'
     show
         defaultIdleTimeout,
+        defaultProxyConnectResponseTimeout,
+        defaultTlsHandshakeTimeout,
         BackoffStrategy,
         defaultBackoffStrategy,
         ChannelOptions;
-export 'src/client/proxy.dart' show Proxy;
+export 'src/client/proxy.dart' show Proxy, ProxyConnectionException;
 export 'src/client/transport/http2_credentials.dart'
     show BadCertificateHandler, allowBadCertificates, ChannelCredentials;
 export 'src/server/call.dart' show ServiceCall;

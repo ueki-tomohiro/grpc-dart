@@ -82,6 +82,12 @@ class FakeChannelOptions implements ChannelOptions {
 
   @override
   Proxy? get proxy => null;
+
+  @override
+  Duration proxyConnectResponseTimeout = defaultProxyConnectResponseTimeout;
+
+  @override
+  Duration tlsHandshakeTimeout = defaultTlsHandshakeTimeout;
 }
 
 class FakeChannel extends ClientChannel {
